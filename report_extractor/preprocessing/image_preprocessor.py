@@ -52,12 +52,13 @@ class ImagePreprocessor:
 
     def __init__(
         self,
-        max_dimension: int = 2048,
-        clahe_clip: float = 2.0,
-        clahe_tile: int = 8,
+        max_dimension: int = 3072,
+        clahe_clip: float = 1.5,  # lowered from 2.0 for less aggressive enhancement
+        clahe_tile: int = 16,     # increased from 8 for larger tiles = less local artifacts
+        clahe_blend: float = 0.7, # blend factor (0-1): higher = more enhancement
         sharpness_threshold: float = 80.0,
         contrast_threshold: float = 35.0,
-        deskew_angle_threshold: float = 1.0,   # lowered — even small skew hurts OCR
+        deskew_angle_threshold: float = 1.5,   # balanced — avoids false rotations on straight documents
         output_grayscale: bool = False,
         skip_excellent_images: bool = True,
         raise_on_unusable: bool = False,
@@ -66,6 +67,7 @@ class ImagePreprocessor:
         self.max_dimension = max_dimension
         self.clahe_clip = clahe_clip
         self.clahe_tile = clahe_tile
+        self.clahe_blend = max(0.0, min(1.0, clahe_blend))  # clamp to [0, 1]
         self.sharpness_threshold = sharpness_threshold
         self.contrast_threshold = contrast_threshold
         self.deskew_angle_threshold = deskew_angle_threshold
@@ -157,8 +159,8 @@ class ImagePreprocessor:
         # 7. Adaptive denoise (strength scaled by measured noise)
         cv_image = self._denoise(cv_image, noise_level=quality.noise_level)
 
-        # 8. Contrast enhancement in LAB colour space
-        cv_image = self._enhance_contrast_lab(cv_image)
+        # 8. Contrast enhancement in LAB colour space (only for poor quality)
+        cv_image = self._enhance_contrast_lab(cv_image, quality=quality)
 
         # 9. Text sharpening (unsharp mask — only when blurry)
         if quality.is_blurry:
@@ -245,7 +247,7 @@ class ImagePreprocessor:
         brightness = float(np.mean(gray))
 
         # Exposure detection
-        is_overexposed = brightness > 200 or np.percentile(gray, 95) > 250
+        is_overexposed = brightness > 230 or np.percentile(gray, 95) > 250
         is_underexposed = brightness < 50 or np.percentile(gray, 5) < 10
 
         # Noise estimation
@@ -287,7 +289,10 @@ class ImagePreprocessor:
             [1, -2, 1]
         ])
 
-        sigma = np.sum(np.abs(cv2.filter2D(gray.astype(np.float64), -1, M)))
+        filtered = cv2.filter2D(gray.astype(np.float64), -1, M)
+        # Exclude 1-pixel border (affected by filter padding, per Immerkaer's paper)
+        filtered = filtered[1:-1, 1:-1]
+        sigma = np.sum(np.abs(filtered))
         sigma = sigma * np.sqrt(0.5 * np.pi) / (6 * (w - 2) * (h - 2))
         return float(sigma)
 
@@ -493,9 +498,14 @@ class ImagePreprocessor:
         for eps_factor in (0.02, 0.03, 0.05):
             approx = cv2.approxPolyDP(largest, eps_factor * peri, True)
             if len(approx) == 4:
+                # Reject non-convex quads (likely false detections from partial borders)
+                if not cv2.isContourConvex(approx):
+                    continue
                 pts = approx.reshape(4, 2).astype(np.float32)
+                logger.info(f"Perspective correction: document quad detected (eps={eps_factor})")
                 return self._four_point_transform(cv_image, pts)
 
+        logger.debug("Perspective correction: no document quadrilateral found — skipped")
         return cv_image
 
     @staticmethod
@@ -520,6 +530,12 @@ class ImagePreprocessor:
         max_h = int(max(height_right, height_left))
 
         if max_w == 0 or max_h == 0:
+            return image
+
+        # Reject degenerate quads with extreme aspect ratios
+        aspect = max_w / max_h
+        if aspect < 0.3 or aspect > 3.0:
+            logger.debug(f"Perspective correction: rejected degenerate quad (aspect={aspect:.2f})")
             return image
 
         dst = np.array([
@@ -608,12 +624,17 @@ class ImagePreprocessor:
         avg_all = (avg_b + avg_g + avg_r) / 3.0
 
         if avg_b == 0 or avg_g == 0 or avg_r == 0:
+            logger.debug("White balance: skipped (zero-mean channel)")
             return cv_image
 
         b = np.clip(b * (avg_all / avg_b), 0, 255)
         g = np.clip(g * (avg_all / avg_g), 0, 255)
         r = np.clip(r * (avg_all / avg_r), 0, 255)
 
+        logger.info(
+            f"White balance: gray-world correction applied "
+            f"(R={avg_r:.0f}, G={avg_g:.0f}, B={avg_b:.0f} → target={avg_all:.0f})"
+        )
         return cv2.merge([b, g, r]).astype(np.uint8)
 
     # ------------------------------------------------------------------ #
@@ -623,29 +644,46 @@ class ImagePreprocessor:
     @staticmethod
     def _remove_shadows(cv_image: np.ndarray) -> np.ndarray:
         """
-        Estimate the background via morphological closing then divide it out.
-        This normalises uneven lighting and removes soft shadows
-        (including finger shadows from hand-held photos).
+        Gentle shadow removal that preserves document texture.
+        Uses a large Gaussian blur (not morphological closing) to estimate
+        the background illumination, then only corrects areas where genuine
+        shadow gradients exist.  The result is blended with the original
+        to avoid the washed-out / smudged look.
         """
-        # Work in LAB so we only touch luminance
         lab = cv2.cvtColor(cv_image, cv2.COLOR_BGR2LAB)
         l_channel, a, b = cv2.split(lab)
 
-        # Large kernel estimates the background illumination
-        kernel_size = max(l_channel.shape[0], l_channel.shape[1]) // 10
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        kernel_size = max(kernel_size, 51)    # minimum kernel size
-        bg = cv2.morphologyEx(
-            l_channel, cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
-        )
+        # Estimate background illumination with a large Gaussian blur
+        # (softer than morphological closing — preserves local paper texture)
+        ksize = max(l_channel.shape[0], l_channel.shape[1]) // 6
+        if ksize % 2 == 0:
+            ksize += 1
+        ksize = max(ksize, 51)
+        bg = cv2.GaussianBlur(l_channel, (ksize, ksize), 0)
 
-        # Divide luminance by estimated background, rescale
-        diff = cv2.divide(l_channel, bg, scale=255)
-        diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+        # Compute difference between background and foreground
+        # Only correct where there's a meaningful shadow (bg significantly brighter)
+        shadow_mask = bg.astype(np.float32) - l_channel.astype(np.float32)
+        shadow_mask = np.clip(shadow_mask, 0, 255)
 
-        lab_corrected = cv2.merge([diff, a, b])
+        # If there's barely any shadow variation, skip entirely
+        mean_shadow = float(np.mean(shadow_mask))
+        if mean_shadow < 8:
+            logger.debug("Shadow removal: no significant shadows detected — skipped")
+            return cv_image
+
+        # Scale correction strength by shadow severity (gentler for mild shadows)
+        correction_strength = min(0.6, mean_shadow / 30.0)
+
+        # Correct by adding back the shadow difference (additive, not divisive)
+        corrected = np.clip(l_channel.astype(np.float32) + shadow_mask * correction_strength, 0, 255).astype(np.uint8)
+
+        # Blend with original — less blending for mild corrections
+        blend = min(0.5, correction_strength)
+        l_result = cv2.addWeighted(corrected, blend, l_channel, 1.0 - blend, 0)
+
+        lab_corrected = cv2.merge([l_result, a, b])
+        logger.info(f"Shadow removal: correction applied (mean_shadow={mean_shadow:.1f}, strength={correction_strength:.2f}, kernel={ksize})")
         return cv2.cvtColor(lab_corrected, cv2.COLOR_LAB2BGR)
 
     # ------------------------------------------------------------------ #
@@ -660,7 +698,12 @@ class ImagePreprocessor:
         - Medium noise (5-15): fastNlMeans (better text preservation)
         - High noise (> 15):  stronger fastNlMeans
         """
+        if noise_level < 2:
+            logger.debug(f"Denoise: skipped — negligible noise (noise_level={noise_level:.1f})")
+            return cv_image
+
         if noise_level < 5:
+            logger.info(f"Denoise: light bilateral filter (noise_level={noise_level:.1f})")
             return cv2.bilateralFilter(cv_image, d=5, sigmaColor=40, sigmaSpace=40)
 
         # fastNlMeansDenoisingColored is slower but dramatically better for
@@ -668,6 +711,10 @@ class ImagePreprocessor:
         h_param = min(int(noise_level * 0.8), 15)   # strength scales with noise
         template_window = 7
         search_window = 21
+        logger.info(
+            f"Denoise: fastNlMeansDenoising applied "
+            f"(noise_level={noise_level:.1f}, h={h_param})"
+        )
         return cv2.fastNlMeansDenoisingColored(
             cv_image, None, h_param, h_param, template_window, search_window,
         )
@@ -676,17 +723,44 @@ class ImagePreprocessor:
     #  STEP 8 — Contrast enhancement in LAB colour space                  #
     # ------------------------------------------------------------------ #
 
-    def _enhance_contrast_lab(self, cv_image: np.ndarray) -> np.ndarray:
-        """Apply CLAHE to the L channel in LAB space (better than grayscale CLAHE)."""
+    def _enhance_contrast_lab(self, cv_image: np.ndarray, quality: Optional[QualityReport] = None) -> np.ndarray:
+        """
+        Apply CLAHE to the L channel in LAB space (only for poor quality images).
+        Skipped for excellent/good quality to avoid over-processing.
+        """
+        # Skip CLAHE for excellent quality and good quality without contrast issues
+        if quality and quality.overall_quality == 'excellent':
+            logger.debug(f"Contrast enhancement: skipped ({quality.overall_quality} quality)")
+            return cv_image
+        if quality and quality.overall_quality == 'good' and not quality.is_low_contrast:
+            logger.debug(f"Contrast enhancement: skipped ({quality.overall_quality} quality, adequate contrast)")
+            return cv_image
+        
         lab = cv2.cvtColor(cv_image, cv2.COLOR_BGR2LAB)
-        l_channel, a, b = cv2.split(lab)
+        l_channel_orig, a, b = cv2.split(lab)
 
         clahe = cv2.createCLAHE(
             clipLimit=self.clahe_clip,
             tileGridSize=(self.clahe_tile, self.clahe_tile),
         )
-        l_channel = clahe.apply(l_channel)
+        l_channel_enhanced = clahe.apply(l_channel_orig)
 
+        # Blend enhanced with original to prevent over-processing
+        if self.clahe_blend < 1.0:
+            l_channel = cv2.addWeighted(
+                l_channel_enhanced, self.clahe_blend,
+                l_channel_orig, 1.0 - self.clahe_blend,
+                0
+            )
+        else:
+            l_channel = l_channel_enhanced
+
+        quality_str = quality.overall_quality if quality else 'unknown'
+        logger.info(
+            f"Contrast enhancement: CLAHE applied in LAB space ({quality_str} quality) "
+            f"(clip={self.clahe_clip}, tile={self.clahe_tile}x{self.clahe_tile}, "
+            f"blend={self.clahe_blend:.1%})"
+        )
         return cv2.cvtColor(cv2.merge([l_channel, a, b]), cv2.COLOR_LAB2BGR)
 
     # ------------------------------------------------------------------ #
@@ -696,6 +770,7 @@ class ImagePreprocessor:
     @staticmethod
     def _sharpen(cv_image: np.ndarray) -> np.ndarray:
         """Unsharp-mask: sharpen text without amplifying noise too much."""
+        logger.info("Sharpening: unsharp mask applied (amount=1.5, sigma=3)")
         blurred = cv2.GaussianBlur(cv_image, (0, 0), sigmaX=3)
         return cv2.addWeighted(cv_image, 1.5, blurred, -0.5, 0)
 
@@ -724,6 +799,7 @@ class ImagePreprocessor:
             cv2.THRESH_BINARY, block_size, 10,
         )
 
+        logger.info(f"Adaptive binarisation: Gaussian threshold applied (block_size={block_size})")
         return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
 
     # ------------------------------------------------------------------ #
@@ -734,8 +810,10 @@ class ImagePreprocessor:
         h, w = cv_image.shape[:2]
         max_side = max(h, w)
         if max_side <= self.max_dimension:
+            logger.debug(f"Resize: not needed ({w}x{h} within {self.max_dimension}px limit)")
             return cv_image
 
         scale = self.max_dimension / max_side
         new_size = (int(w * scale), int(h * scale))
+        logger.info(f"Resize: {w}x{h} → {new_size[0]}x{new_size[1]} (Lanczos4)")
         return cv2.resize(cv_image, new_size, interpolation=cv2.INTER_LANCZOS4)

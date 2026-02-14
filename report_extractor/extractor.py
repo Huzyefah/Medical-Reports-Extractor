@@ -26,15 +26,13 @@ else:
             print(f"\nProcessing {image_path.name}...")
             img = Image.open(image_path).convert("RGB")
 
-            # Show quality metrics
-            quality = preprocessor.assess_quality(img)
+            # Smart preprocess: single pass quality assessment + preprocessing
+            clean_img, quality = preprocessor.smart_preprocess(img)
             print(f"  Sharpness: {quality.sharpness:.1f} | Contrast: {quality.contrast:.1f} | Brightness: {quality.brightness:.1f}")
             if quality.is_blurry:
                 print("  ⚠ Image is blurry — sharpening will be applied")
             if quality.is_low_contrast:
                 print("  ⚠ Low contrast detected — enhancement will be applied")
-
-            clean_img = preprocessor.preprocess(img)
 
             output_path = output_dir / f"clean_{image_path.name}"
             clean_img.save(output_path)
