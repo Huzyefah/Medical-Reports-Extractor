@@ -52,7 +52,7 @@ class ImagePreprocessor:
 
     def __init__(
         self,
-        max_dimension: int = 3072,
+        max_dimension: int = 2048,
         clahe_clip: float = 1.5,  # lowered from 2.0 for less aggressive enhancement
         clahe_tile: int = 16,     # increased from 8 for larger tiles = less local artifacts
         clahe_blend: float = 0.7, # blend factor (0-1): higher = more enhancement
@@ -136,9 +136,10 @@ class ImagePreprocessor:
             logger.warning("Image quality unusable — returning original image")
             return self._convert_output(cv_image), quality
 
-        # Skip preprocessing for excellent images
+        # Skip most preprocessing for excellent images, but always resize
         if quality.overall_quality == 'excellent' and self.skip_excellent_images:
-            logger.info("Image quality excellent — skipping preprocessing")
+            logger.info("Image quality excellent — skipping preprocessing but applying resize")
+            cv_image = self._resize(cv_image)
             return self._convert_output(cv_image), quality
 
         # 2. Scanner border / dark edge removal
