@@ -1,29 +1,63 @@
-# midas_extraction/extraction/vlm_engine.py
+# report_extractor/extraction/vlm_engine.py
 
+import io
 import json
+import logging
+import re
 import ollama
 from PIL import Image
 from typing import Type
 from pydantic import BaseModel
 
+logger = logging.getLogger(__name__)
+
+# Compact expected-output example so the model knows the shape
+_EXAMPLE_OUTPUT = """{
+  "patient": {"name": "John Doe", "age": 45, "gender": "Male", "report_date": "2024-03-15"},
+  "lab_tests": [
+    {"test_name": "Hemoglobin", "value": "13.5", "unit": "g/dL", "reference_range": "13.0-17.0", "abnormal_flag": false}
+  ],
+  "diagnosis": ["Iron deficiency anemia"],
+  "notes": "Follow-up in 4 weeks."
+}"""
+
+_SYSTEM_PROMPT = (
+    "You are a medical data extraction assistant. "
+    "You will be given an image of a medical / lab report. "
+    "Extract every piece of information visible in the image and return it as a JSON object. "
+    "Be thorough — do not skip any lab test rows visible in the report. "
+    "Use null only when a field truly cannot be found in the image."
+)
+
 
 class VLMEngine:
     """
-    Vision-Language extraction engine using local Ollama thiagomoraes/medgemma-4b-it:Q8_0.
+    Vision-Language extraction engine using local Ollama model.
 
-    This module:
-    - sends image + prompt to Ollama
-    - receives structured JSON
-    - returns parsed dict
+    Key design choices
+    ------------------
+    * Uses Ollama's ``format`` parameter with the Pydantic JSON-schema so that
+      generation is **constrained** to valid, schema-conformant JSON — this
+      eliminates most null-field and malformed-output issues.
+    * Keeps the user prompt short and focused so the small model spends its
+      capacity on *reading the image* rather than parsing instructions.
+    * Separates system / user roles for cleaner context.
+    * Retries once with a nudge if the first attempt is mostly nulls.
     """
 
     def __init__(
         self,
         model_name: str = "thiagomoraes/medgemma-4b-it:Q8_0",
-        temperature: float = 0.0,
+        temperature: float = 0.1,
+        max_retries: int = 2,
     ):
         self.model_name = model_name
         self.temperature = temperature
+        self.max_retries = max_retries
+
+    # ------------------------------------------------------------------ #
+    #  PUBLIC API                                                          #
+    # ------------------------------------------------------------------ #
 
     def extract(
         self,
@@ -32,123 +66,144 @@ class VLMEngine:
         system_prompt: str | None = None,
     ) -> dict:
         """
-        Extract structured medical report.
+        Extract structured medical report data from *image*.
 
         Args:
-            image: Preprocessed PIL image
-            schema: Pydantic schema class
-            system_prompt: optional system prompt
+            image:         Preprocessed PIL image.
+            schema:        Pydantic model class whose JSON schema drives output.
+            system_prompt: Optional override for the system message.
 
         Returns:
-            dict matching schema
+            dict conforming to *schema*.
         """
-
-        # Convert schema to JSON schema string
+        image_bytes = self._image_to_bytes(image)
         json_schema = schema.model_json_schema()
+        sys_msg = system_prompt or _SYSTEM_PROMPT
 
-        prompt = f"""
-MEDICAL REPORT EXTRACTION TASK
+        user_prompt = self._build_user_prompt(json_schema)
 
-You are a highly specialized medical data extraction system. Your task is to extract structured clinical information from a medical report image with absolute accuracy and completeness.
+        for attempt in range(1, self.max_retries + 1):
+            logger.info("VLM extraction attempt %d/%d", attempt, self.max_retries)
 
-CRITICAL INSTRUCTIONS:
-1. Extract ONLY information that you can clearly see in the report. Do NOT invent or assume data.
-2. If a field is not present or unclear in the report, set it to null (do not use empty strings or made-up values).
-3. Preserve EXACT values as they appear - do not normalize or reformat unless specified in field descriptions.
-4. For numeric lab values, preserve significant figures and decimal precision exactly as shown.
-5. For categorical results (Negative, Positive, Normal, Abnormal), use the EXACT text from the report.
+            parsed = self._call_ollama(
+                sys_msg, user_prompt, image_bytes, json_schema
+            )
 
-EXTRACTION RULES BY FIELD:
+            if not self._is_mostly_null(parsed):
+                return parsed
 
-Patient Information:
-- name: Extract EXACTLY as written on the report. Include full name if available.
-- age: Extract only the numeric value in years. If DOB is given but not age, calculate the age.
-- gender: Use 'M', 'F', or exact text as shown (Male, Female). Use null if ambiguous.
-- report_date: Extract the date the test was performed/report issued. Format as YYYY-MM-DD. Common labels: "Date of Test", "Report Date", "Specimen Date", "Date Collected", "Date of Service".
+            logger.warning(
+                "Attempt %d returned mostly null values — retrying with nudge.",
+                attempt,
+            )
+            # On retry, add an explicit nudge
+            user_prompt = self._build_retry_prompt(json_schema)
 
-Lab Tests (Complete ALL fields for each test):
-- test_name: Extract the precise lab test name as shown in the report. Do not abbreviate or expand abbreviations unless needed for clarity.
-- value: Extract the numeric or categorical result EXACTLY as displayed. Preserve all precision and decimals. Include negative signs if present.
-- unit: Extract the unit of measurement if present (g/dL, mg/dL, 10^3/μL, etc.). Set to null if no unit displayed.
-- reference_range: Extract the reference/normal range if present (e.g., "13.5-17.5", "70-100 mg/dL"). Look for columns labeled "Reference Range", "Normal Range", "Ref. Range", "Normal Values". Set to null if not provided.
-- abnormal_flag: Set to true ONLY if the report explicitly marks the value as abnormal using symbols (*, ↑, ↓, H, L, HIGH, LOW) or color coding. Otherwise set to false. Set to null if unclear.
+        # Return whatever we got on the last attempt
+        logger.warning("Returning best-effort result after %d attempts.", self.max_retries)
+        return parsed
 
-Diagnosis Section:
-- Extract ONLY clinical diagnoses, impressions, and conclusions - NOT individual lab findings.
-- Common section headers: "Diagnosis", "Impression", "Clinical Summary", "Conclusion", "Assessment".
-- Return as a list of distinct diagnoses, one per item.
-- Use exact medical terminology from the report.
+    # ------------------------------------------------------------------ #
+    #  INTERNALS                                                           #
+    # ------------------------------------------------------------------ #
 
-Notes/Recommendations:
-- Extract clinical notes, recommendations, or physician comments.
-- Common section headers: "Notes", "Recommendations", "Comments", "Remarks", "Follow-up", "Clinical Notes".
-- Capture physician instructions or follow-up orders if present.
+    @staticmethod
+    def _image_to_bytes(image: Image.Image) -> bytes:
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        return buf.getvalue()
 
-OUTPUT REQUIREMENTS:
-- Return ONLY a single, valid JSON object matching this exact schema:
+    @staticmethod
+    def _build_user_prompt(json_schema: dict) -> str:
+        """Short, focused prompt — keeps model attention on the image."""
+        return (
+            "Look at this medical report image carefully.\n"
+            "Extract ALL patient information, lab test results, diagnoses, and notes.\n\n"
+            "Rules:\n"
+            "- Read every row in every table in the image.\n"
+            "- Preserve exact values, units, and reference ranges as printed.\n"
+            "- For dates use YYYY-MM-DD format.\n"
+            "- Use null ONLY when a field is truly absent from the image.\n"
+            "- abnormal_flag: true if marked abnormal (H/L/*/↑/↓), false otherwise.\n\n"
+            f"Example output shape:\n{_EXAMPLE_OUTPUT}\n\n"
+            "Now extract from the image above. Return ONLY the JSON."
+        )
 
-{json.dumps(json_schema, indent=2)}
+    @staticmethod
+    def _build_retry_prompt(json_schema: dict) -> str:
+        return (
+            "The previous extraction had too many null values. "
+            "Please look at the medical report image again MORE CAREFULLY.\n\n"
+            "- Read EVERY line of text in the image.\n"
+            "- Extract the patient name, age, gender, date.\n"
+            "- Extract ALL lab tests with their values, units, and reference ranges.\n"
+            "- Do NOT leave fields as null if you can see the information in the image.\n\n"
+            f"Expected output shape:\n{_EXAMPLE_OUTPUT}\n\n"
+            "Return ONLY the JSON."
+        )
 
-- No explanations before or after the JSON
-- No markdown code blocks
-- No additional text whatsoever
-- All field names and types must match the schema exactly
-- Use null for missing/unclear fields (not empty strings or false)
-- Use arrays [] for list fields with no data (not null)
-- Ensure all dates are in YYYY-MM-DD format
-- Double-check JSON validity before returning
-"""
+    def _call_ollama(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_bytes: bytes,
+        json_schema: dict,
+    ) -> dict:
+        """Single Ollama round-trip with structured-output constraint."""
 
-        if system_prompt:
-            prompt = system_prompt + "\n\n" + prompt
-
-        # Convert PIL image to bytes
-        import io
-        image_bytes = io.BytesIO()
-        image.save(image_bytes, format="PNG")
-        image_bytes = image_bytes.getvalue()
-
-        # Call Ollama
         response = ollama.chat(
             model=self.model_name,
+            format=json_schema,          # ← constrained structured output
             options={
                 "temperature": self.temperature,
+                "num_predict": 4096,
             },
             messages=[
                 {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
                     "role": "user",
-                    "content": prompt,
+                    "content": user_prompt,
                     "images": [image_bytes],
-                }
+                },
             ],
         )
 
         content = response["message"]["content"]
+        logger.debug("Raw VLM response:\n%s", content)
 
-        # Clean up the response - remove markdown code blocks
-        content = content.strip()
-        if content.startswith("```"):
-            # Remove markdown code block wrapper
-            lines = content.split("\n")
-            # Find the start and end of JSON
-            start_idx = 0
-            for i, line in enumerate(lines):
-                if line.strip().startswith("```"):
-                    start_idx = i + 1
-                    break
-            
-            end_idx = len(lines)
-            for i in range(len(lines) - 1, -1, -1):
-                if lines[i].strip().startswith("```"):
-                    end_idx = i
-                    break
-            
-            content = "\n".join(lines[start_idx:end_idx]).strip()
+        content = self._strip_markdown_fences(content)
 
-        # Parse JSON safely
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:
             raise ValueError(f"Invalid JSON from model:\n{content}")
 
         return parsed
+
+    # ------------------------------------------------------------------ #
+    #  HELPERS                                                             #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _strip_markdown_fences(text: str) -> str:
+        """Remove ```json … ``` wrappers if present."""
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        return text.strip()
+
+    @staticmethod
+    def _is_mostly_null(data: dict, threshold: float = 0.7) -> bool:
+        """Return True if ≥ threshold of top-level values are None / empty."""
+        if not data:
+            return True
+        values = list(data.values())
+        null_count = sum(
+            1 for v in values
+            if v is None or v == [] or v == {} or v == ""
+        )
+        return (null_count / len(values)) >= threshold
